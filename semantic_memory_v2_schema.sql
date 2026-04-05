@@ -1,5 +1,5 @@
 -- ═══════════════════════════════════════════════════════════════════════════
--- Semantic Memory v2 - Database Schema
+-- Semantic Memory v2 - Database Schema (Voyage AI - 1024 dimensions)
 -- Vector embeddings, memory graphs, intelligent retrieval
 -- ═══════════════════════════════════════════════════════════════════════════
 
@@ -18,35 +18,35 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     
     -- Content
     content TEXT NOT NULL,
-    summary TEXT, -- Auto-generated short summary
-    embedding VECTOR(1536), -- OpenAI ada-002 / text-embedding-3-small
+    summary TEXT,
+    embedding VECTOR(1024), -- Voyage AI voyage-2 dimension
     
     -- Classification
-    memory_type TEXT NOT NULL DEFAULT 'long_term', -- short_term, long_term, episodic, shared
+    memory_type TEXT NOT NULL DEFAULT 'long_term',
     importance INTEGER DEFAULT 5 CHECK (importance BETWEEN 1 AND 10),
     confidence FLOAT DEFAULT 1.0 CHECK (confidence BETWEEN 0 AND 1),
     
     -- Organization
     tags TEXT[],
     category TEXT,
-    source TEXT, -- which agent/system created this
+    source TEXT,
     
     -- Metadata
     metadata JSONB DEFAULT '{}',
     
     -- Access control
-    access_level TEXT DEFAULT 'private', -- private, shared, public
-    shared_with TEXT[], -- agent_ids with access
+    access_level TEXT DEFAULT 'private',
+    shared_with TEXT[],
     
     -- Lifecycle
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     accessed_at TIMESTAMPTZ DEFAULT NOW(),
     access_count INTEGER DEFAULT 0,
-    expires_at TIMESTAMPTZ, -- NULL = never expires
+    expires_at TIMESTAMPTZ,
     
     -- Status
-    status TEXT DEFAULT 'active', -- active, archived, superseded, deleted
+    status TEXT DEFAULT 'active',
     superseded_by UUID,
     
     CHECK (memory_type IN ('short_term', 'long_term', 'episodic', 'shared')),
@@ -54,14 +54,13 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     CHECK (status IN ('active', 'archived', 'superseded', 'deleted'))
 );
 
--- Indexes
 CREATE INDEX IF NOT EXISTS me_agent_idx ON memory_entries(agent_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS me_type_idx ON memory_entries(memory_type, status);
 CREATE INDEX IF NOT EXISTS me_tags_idx ON memory_entries USING GIN(tags);
 CREATE INDEX IF NOT EXISTS me_importance_idx ON memory_entries(importance DESC, created_at DESC);
 CREATE INDEX IF NOT EXISTS me_expires_idx ON memory_entries(expires_at) WHERE expires_at IS NOT NULL;
 
--- Vector similarity index (HNSW for fast ANN search)
+-- Vector similarity index
 CREATE INDEX IF NOT EXISTS me_embedding_idx ON memory_entries 
 USING hnsw (embedding vector_cosine_ops)
 WHERE embedding IS NOT NULL AND status = 'active';
@@ -74,15 +73,12 @@ CREATE TABLE IF NOT EXISTS memory_links (
     from_memory_id UUID NOT NULL REFERENCES memory_entries(id) ON DELETE CASCADE,
     to_memory_id UUID NOT NULL REFERENCES memory_entries(id) ON DELETE CASCADE,
     
-    -- Link type
-    relationship_type TEXT NOT NULL, -- related_to, contradicts, expands_on, caused_by, leads_to, evidence_for
+    relationship_type TEXT NOT NULL,
     strength FLOAT DEFAULT 0.5 CHECK (strength BETWEEN 0 AND 1),
     
-    -- Metadata
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    created_by TEXT, -- agent_id
+    created_by TEXT,
     
-    -- Prevent duplicate links
     UNIQUE(from_memory_id, to_memory_id, relationship_type),
     CHECK (from_memory_id != to_memory_id),
     CHECK (relationship_type IN ('related_to', 'contradicts', 'expands_on', 'caused_by', 'leads_to', 'evidence_for', 'replaces'))
@@ -100,15 +96,13 @@ CREATE TABLE IF NOT EXISTS memory_sessions (
     agent_id TEXT NOT NULL,
     session_name TEXT,
     
-    -- Session context
     context JSONB DEFAULT '{}',
-    memory_ids UUID[], -- memories active in this session
+    memory_ids UUID[],
     
-    -- Lifecycle
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     expires_at TIMESTAMPTZ,
-    status TEXT DEFAULT 'active', -- active, completed, expired
+    status TEXT DEFAULT 'active',
     
     CHECK (status IN ('active', 'completed', 'expired'))
 );
@@ -124,15 +118,12 @@ CREATE TABLE IF NOT EXISTS memory_access_log (
     memory_id UUID NOT NULL REFERENCES memory_entries(id) ON DELETE CASCADE,
     agent_id TEXT NOT NULL,
     
-    -- Access details
-    access_type TEXT NOT NULL, -- retrieve, search, update, delete
-    relevance_score FLOAT, -- how relevant was this memory to the query
+    access_type TEXT NOT NULL,
+    relevance_score FLOAT,
     
-    -- Query context
     query_text TEXT,
-    query_embedding VECTOR(1536),
+    query_embedding VECTOR(1024),
     
-    -- Metadata
     accessed_at TIMESTAMPTZ DEFAULT NOW(),
     session_id UUID REFERENCES memory_sessions(id),
     
@@ -147,10 +138,10 @@ CREATE INDEX IF NOT EXISTS mal_agent_idx ON memory_access_log(agent_id, accessed
 CREATE TABLE IF NOT EXISTS embedding_cache (
     id BIGSERIAL PRIMARY KEY,
     
-    text_hash TEXT UNIQUE NOT NULL, -- SHA256 hash of text
+    text_hash TEXT UNIQUE NOT NULL,
     text TEXT NOT NULL,
-    embedding VECTOR(1536) NOT NULL,
-    model TEXT NOT NULL, -- openai-ada-002, text-embedding-3-small, etc.
+    embedding VECTOR(1024) NOT NULL,
+    model TEXT NOT NULL,
     
     created_at TIMESTAMPTZ DEFAULT NOW(),
     last_used TIMESTAMPTZ DEFAULT NOW(),
@@ -162,7 +153,6 @@ CREATE INDEX IF NOT EXISTS ec_model_idx ON embedding_cache(model, last_used DESC
 
 -- ─── Helper Functions ─────────────────────────────────────────────────────
 
--- Update timestamps
 CREATE OR REPLACE FUNCTION update_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -175,31 +165,8 @@ CREATE TRIGGER memory_entries_updated_at
 BEFORE UPDATE ON memory_entries
 FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
--- Auto-expire short-term memories
-CREATE OR REPLACE FUNCTION auto_expire_short_term()
-RETURNS void AS $$
-BEGIN
-    UPDATE memory_entries
-    SET status = 'archived'
-    WHERE memory_type = 'short_term'
-    AND expires_at < NOW()
-    AND status = 'active';
-END;
-$$ LANGUAGE plpgsql;
-
--- Track memory access
-CREATE OR REPLACE FUNCTION track_memory_access()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.accessed_at = NOW();
-    NEW.access_count = NEW.access_count + 1;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
 -- ─── Views ────────────────────────────────────────────────────────────────
 
--- Active memories with computed relevance decay
 CREATE OR REPLACE VIEW active_memories AS
 SELECT 
     id,
@@ -214,9 +181,7 @@ SELECT
     created_at,
     accessed_at,
     access_count,
-    -- Time decay: importance * (1 - age_factor)
     importance * (1 - LEAST(EXTRACT(EPOCH FROM (NOW() - created_at)) / (86400 * 30), 0.5)) as relevance_score,
-    -- Recency: memories accessed recently are more relevant
     importance * (1 + (access_count * 0.1)) * 
         CASE 
             WHEN accessed_at > NOW() - INTERVAL '1 day' THEN 1.5
@@ -227,7 +192,6 @@ FROM memory_entries
 WHERE status = 'active'
 AND (expires_at IS NULL OR expires_at > NOW());
 
--- Memory graph statistics
 CREATE OR REPLACE VIEW memory_graph_stats AS
 SELECT 
     agent_id,
@@ -243,8 +207,8 @@ LEFT JOIN memory_links ml ON ml.from_memory_id = me.id OR ml.to_memory_id = me.i
 WHERE me.status = 'active'
 GROUP BY agent_id;
 
-COMMENT ON TABLE memory_entries IS 'Semantic memory storage with vector embeddings';
+COMMENT ON TABLE memory_entries IS 'Semantic memory storage with Voyage AI embeddings (1024 dim)';
 COMMENT ON TABLE memory_links IS 'Graph relationships between memories';
 COMMENT ON TABLE memory_sessions IS 'Short-term session contexts';
 COMMENT ON TABLE memory_access_log IS 'Memory retrieval and usage tracking';
-COMMENT ON TABLE embedding_cache IS 'Cached embeddings to reduce API calls';
+COMMENT ON TABLE embedding_cache IS 'Cached Voyage AI embeddings to reduce API calls';

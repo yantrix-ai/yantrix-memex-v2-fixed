@@ -1,6 +1,6 @@
 """
 Yantrix Semantic Memory v2
-Vector-based semantic search, memory graphs, intelligent retrieval
+Vector-based semantic search with Voyage AI embeddings
 """
 
 import os, uuid, hashlib, logging
@@ -22,9 +22,10 @@ app = FastAPI(title="Yantrix Semantic Memory v2", version="2.0.0")
 # ─── Configuration ────────────────────────────────────────────────────────
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-EMBEDDING_DIM = 1536
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "voyage-2")
+EMBEDDING_DIM = 1024  # voyage-2 dimension
 
 pool = None
 
@@ -46,12 +47,12 @@ async def shutdown():
 class MemoryStore(BaseModel):
     agent_id: str
     content: str
-    memory_type: str = "long_term"  # short_term, long_term, episodic, shared
+    memory_type: str = "long_term"
     importance: int = 5
     tags: List[str] = []
     category: Optional[str] = None
     access_level: str = "private"
-    expires_in_hours: Optional[int] = None  # Auto-set expires_at
+    expires_in_hours: Optional[int] = None
     metadata: dict = {}
 
 class MemorySearch(BaseModel):
@@ -65,19 +66,13 @@ class MemorySearch(BaseModel):
 class MemoryLink(BaseModel):
     from_memory_id: str
     to_memory_id: str
-    relationship_type: str  # related_to, contradicts, expands_on, etc.
+    relationship_type: str
     strength: float = 0.5
-
-class SessionContext(BaseModel):
-    agent_id: str
-    session_name: Optional[str] = None
-    context: dict = {}
-    expires_in_hours: int = 24
 
 # ─── Embedding Functions ──────────────────────────────────────────────────
 
 async def get_embedding(text: str, use_cache: bool = True) -> List[float]:
-    """Get embedding with caching"""
+    """Get embedding with Voyage AI"""
     text_hash = hashlib.sha256(text.encode()).hexdigest()
     
     # Check cache
@@ -94,16 +89,16 @@ async def get_embedding(text: str, use_cache: bool = True) -> List[float]:
                 )
                 return cached["embedding"]
     
-    # Call OpenAI API
+    # Call Voyage AI API
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                "https://api.openai.com/v1/embeddings",
+                "https://api.voyageai.com/v1/embeddings",
                 headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Authorization": f"Bearer {VOYAGE_API_KEY}",
                     "Content-Type": "application/json"
                 },
-                json={"input": text, "model": EMBEDDING_MODEL},
+                json={"input": [text], "model": EMBEDDING_MODEL},
                 timeout=10.0
             )
             data = resp.json()
@@ -125,32 +120,32 @@ async def get_embedding(text: str, use_cache: bool = True) -> List[float]:
         raise HTTPException(500, detail="Embedding generation failed")
 
 async def generate_summary(text: str) -> str:
-    """Generate short summary using OpenAI"""
+    """Generate short summary using Claude"""
     if len(text) < 100:
         return text
     
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
+                "https://api.anthropic.com/v1/messages",
                 headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "gpt-4o-mini",
+                    "model": "claude-3-haiku-20240307",
+                    "max_tokens": 100,
                     "messages": [
-                        {"role": "system", "content": "Summarize in 1-2 sentences."},
-                        {"role": "user", "content": text}
-                    ],
-                    "max_tokens": 100
+                        {"role": "user", "content": f"Summarize in 1-2 sentences:\n\n{text}"}
+                    ]
                 },
                 timeout=10.0
             )
             data = resp.json()
-            return data["choices"][0]["message"]["content"].strip()
+            return data["content"][0]["text"].strip()
     except Exception:
-        return text[:200]  # Fallback: first 200 chars
+        return text[:200]  # Fallback
 
 # ─── API Endpoints ────────────────────────────────────────────────────────
 
@@ -201,7 +196,7 @@ async def search_memories(search: MemorySearch):
     # Get query embedding
     query_embedding = await get_embedding(search.query)
     
-    # Hybrid search: vector similarity + keyword matching + time decay
+    # Hybrid search
     async with pool.acquire() as conn:
         memories = await conn.fetch("""
             SELECT 
@@ -216,14 +211,11 @@ async def search_memories(search: MemorySearch):
                 created_at,
                 accessed_at,
                 access_count,
-                -- Vector similarity (cosine distance)
                 1 - (embedding <=> $1) as similarity,
-                -- Keyword boost
                 CASE 
                     WHEN content ILIKE '%' || $2 || '%' THEN 0.2
                     ELSE 0.0
                 END as keyword_boost,
-                -- Time decay
                 importance * (1 - LEAST(EXTRACT(EPOCH FROM (NOW() - created_at)) / (86400 * 30), 0.5)) as time_score
             FROM memory_entries
             WHERE agent_id = $3
@@ -238,13 +230,12 @@ async def search_memories(search: MemorySearch):
             search.memory_types, search.limit
         )
         
-        # Filter by minimum relevance
         results = [
             dict(m) for m in memories 
             if m["similarity"] >= search.min_relevance
         ]
         
-        # Optionally include related memories
+        # Include related memories
         if search.include_related and results:
             memory_ids = [r["id"] for r in results]
             related = await conn.fetch("""
@@ -310,7 +301,6 @@ async def create_link(link: MemoryLink):
 async def get_memory_graph(agent_id: str, limit: int = 50):
     """Get memory graph for agent"""
     async with pool.acquire() as conn:
-        # Get memories
         memories = await conn.fetch("""
             SELECT id, content, summary, memory_type, importance, tags, created_at
             FROM memory_entries
@@ -321,7 +311,6 @@ async def get_memory_graph(agent_id: str, limit: int = 50):
         
         memory_ids = [m["id"] for m in memories]
         
-        # Get links between them
         links = await conn.fetch("""
             SELECT from_memory_id, to_memory_id, relationship_type, strength
             FROM memory_links
@@ -338,7 +327,6 @@ async def get_memory_graph(agent_id: str, limit: int = 50):
 async def consolidate_memories(agent_id: str, similarity_threshold: float = 0.9):
     """Find and merge similar memories"""
     async with pool.acquire() as conn:
-        # Find similar memory pairs
         similar = await conn.fetch("""
             SELECT 
                 m1.id as id1, 
@@ -357,7 +345,6 @@ async def consolidate_memories(agent_id: str, similarity_threshold: float = 0.9)
         
         consolidated = []
         for pair in similar:
-            # Mark older as superseded
             await conn.execute("""
                 UPDATE memory_entries
                 SET status = 'superseded', superseded_by = $2
@@ -378,7 +365,7 @@ async def consolidate_memories(agent_id: str, similarity_threshold: float = 0.9)
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "semantic-memory-v2"}
+    return {"status": "healthy", "service": "semantic-memory-v2", "embedding": EMBEDDING_MODEL}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
