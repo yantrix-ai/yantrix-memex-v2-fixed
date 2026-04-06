@@ -230,14 +230,16 @@ async def search_memories(search: MemorySearch):
             search.memory_types, search.limit
         )
         
+        # Convert Records to dicts properly
         results = [
-            dict(m) for m in memories 
+            {key: str(m[key]) if isinstance(m[key], uuid.UUID) else m[key] for key in m.keys()}
+            for m in memories 
             if m["similarity"] >= search.min_relevance
         ]
         
         # Include related memories
         if search.include_related and results:
-            memory_ids = [r["id"] for r in results]
+            memory_ids = [uuid.UUID(r["id"]) for r in results]
             related = await conn.fetch("""
                 SELECT DISTINCT me.*
                 FROM memory_links ml
@@ -249,7 +251,7 @@ async def search_memories(search: MemorySearch):
             """, memory_ids)
             
             for r in related:
-                results.append(dict(r))
+                results.append({key: str(r[key]) if isinstance(r[key], uuid.UUID) else r[key] for key in r.keys()})
     
     return {
         "query": search.query,
@@ -276,7 +278,9 @@ async def get_memory(memory_id: str):
             WHERE id = $1
         """, uuid.UUID(memory_id))
         
-        return dict(memory)
+        # Convert asyncpg Record to dict properly
+        return {key: str(memory[key]) if isinstance(memory[key], uuid.UUID) else memory[key] 
+                for key in memory.keys()}
 
 @app.post("/v2/memory/link")
 async def create_link(link: MemoryLink):
@@ -317,10 +321,11 @@ async def get_memory_graph(agent_id: str, limit: int = 50):
             WHERE from_memory_id = ANY($1) AND to_memory_id = ANY($1)
         """, memory_ids)
         
+        # Convert Records to dicts properly
         return {
             "agent_id": agent_id,
-            "memories": [dict(m) for m in memories],
-            "links": [dict(l) for l in links]
+            "memories": [{key: str(m[key]) if isinstance(m[key], uuid.UUID) else m[key] for key in m.keys()} for m in memories],
+            "links": [{key: str(l[key]) if isinstance(l[key], uuid.UUID) else l[key] for key in l.keys()} for l in links]
         }
 
 @app.post("/v2/memory/consolidate")
