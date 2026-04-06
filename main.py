@@ -3,7 +3,7 @@ Yantrix Semantic Memory v2
 Vector-based semantic search with Voyage AI embeddings
 """
 
-import os, uuid, hashlib, logging
+import os, uuid, hashlib, logging, json
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
 
@@ -180,7 +180,7 @@ async def store_memory(memory: MemoryStore, background_tasks: BackgroundTasks):
         """, 
             memory.agent_id, memory.content, summary, embedding, memory.memory_type,
             memory.importance, memory.tags, memory.category, memory.access_level,
-            memory.metadata, expires_at
+            json.dumps(memory.metadata), expires_at
         )
     
     return {
